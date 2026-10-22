@@ -224,6 +224,21 @@ class AppTests(unittest.TestCase):
         self.assertTrue(any("API Key" in info.value for info in app.info))
         self.assertEqual(len(app.chat_input), 0)
 
+    def test_web_uses_shared_environment_defaults_and_keeps_session_overrides_local(self):
+        from settings import load_rag_settings
+
+        os.environ.update(
+            DASHSCOPE_API_KEY="test-key-only", RAG_TOP_K="7", RAG_RELEVANCE_THRESHOLD="0.6",
+        )
+        app = self.configured_app()
+        self.assertEqual(app.session_state["settings"], load_rag_settings())
+        self.assertEqual(app.slider[0].value, 0.6)
+        app.slider[0].set_value(0.65).run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.session_state["settings"].relevance_threshold, 0.65)
+        self.assertEqual(app.session_state["settings"].top_k, 7)
+        self.assertEqual(load_rag_settings().relevance_threshold, 0.6)
+
     def test_answer_sources_and_clear_conversation(self):
         app = self.configured_app()
         app.chat_input[0].set_value("活动什么时候举行？").run()

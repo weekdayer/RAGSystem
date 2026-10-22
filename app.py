@@ -1,21 +1,17 @@
 """运行：python -m streamlit run app.py。"""
 
+from dataclasses import replace
 import logging
-import os
-from pathlib import Path
 
 import streamlit as st
-from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
 from prompts import PROMPT_VERSION
-from rag import RAGService, RagSettings
+from rag import RAGService
 from speech import SpeechServiceError
-from settings import faq_matching_options
+from settings import load_rag_settings
 
 
-ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
 logger = logging.getLogger(__name__)
 CHAT_INPUT_KEY = "chat_composer"
 
@@ -164,33 +160,36 @@ def transcribe_pending_audio(api_key: str, base_url: str) -> None:
 
 def connection_service():
     """入口共用的连接控件；切换页面时保留连接和聊天状态。"""
+    try:
+        defaults = load_rag_settings()
+    except ValueError as error:
+        show_error(error, "配置加载失败")
+        return None
     with st.sidebar:
         st.header("1. 连接百炼")
         api_key = st.text_input(
             "API Key",
-            value=os.getenv("DASHSCOPE_API_KEY", ""),
+            value=defaults.api_key,
             type="password",
             help="可在本地 .env 配置，也可在此临时输入；网页输入不会写入文件。",
         ).strip()
         with st.expander("模型与调用地址"):
             base_url = st.text_input(
                 "Base URL",
-                value=os.getenv(
-                    "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
-                ),
+                value=defaults.base_url,
                 help="填写与 API Key 同地域的 OpenAI 兼容地址，以 /compatible-mode/v1 结尾。",
             ).strip().rstrip("/")
             chat_model = st.text_input(
-                "回答模型", value=os.getenv("CHAT_MODEL", "qwen-plus")
+                "回答模型", value=defaults.chat_model
             ).strip()
             embedding_model = st.text_input(
-                "向量模型", value=os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
+                "向量模型", value=defaults.embedding_model
             ).strip()
             relevance_threshold = st.slider(
                 "最低资料相关度",
                 min_value=0.0,
                 max_value=1.0,
-                value=0.35,
+                value=defaults.relevance_threshold,
                 step=0.05,
                 help="越高越严格。仅引用达到此值的资料，其余问题由模型回答。相关度采用余弦相似度，不代表回答正确率。",
             )
@@ -202,14 +201,13 @@ def connection_service():
         return None
 
     try:
-        settings = RagSettings(
+        settings = replace(
+            defaults,
             api_key=api_key,
             base_url=base_url,
             chat_model=chat_model,
             embedding_model=embedding_model,
-            persist_directory=Path(os.getenv("CHROMA_PERSIST_DIRECTORY", str(ROOT / "data" / "chroma"))),
             relevance_threshold=relevance_threshold,
-            **faq_matching_options(),
         )
         previous_settings = st.session_state.get("settings")
         if (

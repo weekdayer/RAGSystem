@@ -454,6 +454,107 @@ class FAQService:
                 scores[faq_id] = max(score, scores.get(faq_id, 0.0))
         return scores
 
+    def _collect_candidates(
+        self, question: str, items: list[dict]
+    ) -> tuple[list[dict], dict[str, dict]]:
+        """Merge vector and keyword candidates, keeping each FAQ's best scores."""
+        with self._index_lock:
+            collection = self._sync_index(items)
+            keyword_scores = self._keyword_scores(items, question)
+            query_vector = self.embeddings.embed_query(question)
+            if _cosine(query_vector, query_vector) is None:
+                return [], {}
+            vector_count = collection.count()
+            if not vector_count:
+                return [], {}
+            results = collection.query(
+                query_embeddings=[query_vector], n_results=min(vector_count, MAX_ALIASES + 2),
+                include=["metadatas", "embeddings"],
+            )
+            if results["embeddings"] is None:
+                return [], {}
+            vector_candidates = dict(zip(
+                results["ids"][0],
+                zip(results["metadatas"][0], results["embeddings"][0]),
+            ))
+            if keyword_scores:
+                # Union keyword candidates with vector candidates. Fetch every alias of
+                # those FAQs so their strongest semantic score cannot be hidden by ANN.
+                lexical = collection.get(
+                    where={"faq_id": {"$in": list(keyword_scores)}},
+                    include=["metadatas", "embeddings"],
+                )
+                if lexical["embeddings"] is not None:
+                    vector_candidates.update(zip(
+                        lexical["ids"], zip(lexical["metadatas"], lexical["embeddings"]),
+                    ))
+            # Re-read SQLite so a concurrently deleted answer can never be returned.
+            current_items = {item["id"]: item for item in self.list()}
+            scores = {}
+            for metadata, vector in vector_candidates.values():
+                faq_id = (metadata or {}).get("faq_id")
+                if faq_id not in current_items:
+                    continue
+                score = _cosine(query_vector, vector)
+                if score is not None:
+                    scores[faq_id] = max(score, scores.get(faq_id, -1.0))
+        candidates = [
+            {
+                "id": faq_id, "question": current_items[faq_id]["question"],
+                "semantic_score": score, "bm25_score": keyword_scores.get(faq_id, 0.0),
+            }
+            for faq_id, score in scores.items()
+        ]
+        return candidates, current_items
+
+    @staticmethod
+    def _rank_candidates(candidates: list[dict]) -> list[dict]:
+        """Combine semantic and normalized BM25 scores, then rank complete FAQs."""
+        keyword_max = max((item["bm25_score"] for item in candidates), default=0.0)
+        ranked = []
+        for candidate in candidates:
+            # With no keyword overlap, preserve the existing semantic margin behavior.
+            hybrid_score = (
+                0.8 * candidate["semantic_score"] + 0.2 * candidate["bm25_score"] / keyword_max
+                if keyword_max > 0 else candidate["semantic_score"]
+            )
+            ranked.append({**candidate, "hybrid_score": hybrid_score})
+        ranked.sort(key=lambda item: (item["hybrid_score"], item["semantic_score"]), reverse=True)
+        return ranked
+
+    @staticmethod
+    def _decide_match(candidates: list[dict], items: dict[str, dict], settings: dict) -> dict:
+        """Apply the semantic threshold and winning margin to the top hybrid result."""
+        decision = {"matched": False, "reason": "no_candidates", "match": None}
+        if not candidates:
+            return decision
+        winner = candidates[0]
+        # Gate the overall hybrid winner; never discard a low-semantic keyword hit
+        # and then force a different FAQ merely because its cosine is higher.
+        if (
+            winner["semantic_score"] < settings["threshold"]
+            and not math.isclose(
+                winner["semantic_score"], settings["threshold"], rel_tol=0.0, abs_tol=1e-7
+            )
+        ):
+            decision["reason"] = "below_threshold"
+            return decision
+        if (
+            len(candidates) > 1
+            and winner["hybrid_score"] - candidates[1]["hybrid_score"] < settings["min_margin"]
+        ):
+            decision["reason"] = "ambiguous"
+            return decision
+        item = items[winner["id"]]
+        decision.update(
+            matched=True, reason="hybrid",
+            match={
+                "id": item["id"], "question": item["question"], "answer": item["answer"],
+                "match_method": "semantic",
+            },
+        )
+        return decision
+
     def preview(self, question: str) -> dict:
         """Explain the same exact/hybrid decision that normal chat will use.
 
@@ -486,89 +587,9 @@ class FAQService:
         if not items:
             result["reason"] = "empty"
             return result
-        with self._index_lock:
-            collection = self._sync_index(items)
-            keyword_scores = self._keyword_scores(items, question)
-            query_vector = self.embeddings.embed_query(question)
-            if _cosine(query_vector, query_vector) is None:
-                return result
-            vector_count = collection.count()
-            if not vector_count:
-                return result
-            results = collection.query(
-                query_embeddings=[query_vector], n_results=min(vector_count, MAX_ALIASES + 2),
-                include=["metadatas", "embeddings"],
-            )
-            if results["embeddings"] is None:
-                return result
-            vector_candidates = dict(zip(
-                results["ids"][0],
-                zip(results["metadatas"][0], results["embeddings"][0]),
-            ))
-            if keyword_scores:
-                # Union keyword candidates with vector candidates. Fetch every alias of
-                # those FAQs so their strongest semantic score cannot be hidden by ANN.
-                lexical = collection.get(
-                    where={"faq_id": {"$in": list(keyword_scores)}},
-                    include=["metadatas", "embeddings"],
-                )
-                if lexical["embeddings"] is not None:
-                    vector_candidates.update(zip(
-                        lexical["ids"], zip(lexical["metadatas"], lexical["embeddings"]),
-                    ))
-            # Re-read SQLite so a concurrently deleted answer can never be returned.
-            current_items = {item["id"]: item for item in self.list()}
-            scores = {}
-            for metadata, vector in vector_candidates.values():
-                faq_id = (metadata or {}).get("faq_id")
-                if faq_id not in current_items:
-                    continue
-                score = _cosine(query_vector, vector)
-                if score is not None:
-                    scores[faq_id] = max(score, scores.get(faq_id, -1.0))
-        keyword_max = max((keyword_scores.get(faq_id, 0.0) for faq_id in scores), default=0.0)
-        candidates = []
-        for faq_id, semantic_score in scores.items():
-            keyword_score = keyword_scores.get(faq_id, 0.0)
-            # With no keyword overlap, preserve the existing semantic margin behavior.
-            hybrid_score = (
-                0.8 * semantic_score + 0.2 * keyword_score / keyword_max
-                if keyword_max > 0 else semantic_score
-            )
-            candidates.append({
-                "id": faq_id, "question": current_items[faq_id]["question"],
-                "semantic_score": semantic_score, "bm25_score": keyword_score,
-                "hybrid_score": hybrid_score,
-            })
-        candidates.sort(key=lambda item: (item["hybrid_score"], item["semantic_score"]), reverse=True)
-        result["candidates"] = candidates
-        if not candidates:
-            return result
-        winner = candidates[0]
-        # Gate the overall hybrid winner; never discard a low-semantic keyword hit
-        # and then force a different FAQ merely because its cosine is higher.
-        if (
-            winner["semantic_score"] < settings["threshold"]
-            and not math.isclose(
-                winner["semantic_score"], settings["threshold"], rel_tol=0.0, abs_tol=1e-7
-            )
-        ):
-            result["reason"] = "below_threshold"
-            return result
-        if (
-            len(candidates) > 1
-            and winner["hybrid_score"] - candidates[1]["hybrid_score"] < settings["min_margin"]
-        ):
-            result["reason"] = "ambiguous"
-            return result
-        item = current_items[winner["id"]]
-        result.update(
-            matched=True, reason="hybrid",
-            match={
-                "id": item["id"], "question": item["question"], "answer": item["answer"],
-                "match_method": "semantic",
-            },
-        )
+        candidates, current_items = self._collect_candidates(question, items)
+        result["candidates"] = self._rank_candidates(candidates)
+        result.update(self._decide_match(result["candidates"], current_items, settings))
         return result
 
     def match(self, question: str) -> Document | None:
